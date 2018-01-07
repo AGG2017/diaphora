@@ -40,7 +40,7 @@ except ImportError:
   is_ida = False
 
 #-----------------------------------------------------------------------
-VERSION_VALUE = "1.2.1"
+VERSION_VALUE = "1.2.2"
 COPYRIGHT_VALUE="Copyright(c) 2015-2018 Joxean Koret"
 COMMENT_VALUE="Diaphora diffing plugin for IDA version %s" % VERSION_VALUE
 
@@ -197,6 +197,7 @@ class CBinDiff:
     self.slow_heuristics = False
     self.use_decompiler_always = True
     self.exclude_library_thunk = True
+    self.use_alt_asm_cleaning = False
 
     # Create the choosers
     self.chooser = chooser
@@ -331,6 +332,7 @@ class CBinDiff:
     sql = """ create table if not exists instructions (
                 id integer primary key,
                 address text unique,
+                label text,
                 disasm text,
                 mnemonic text,
                 comment1 text,
@@ -586,16 +588,16 @@ class CBinDiff:
       # The last 2 fields are basic_blocks_data & bb_relations
       bb_data, bb_relations = props[len(props)-2:]
       instructions_ids = {}
-      sql = """insert into main.instructions (address, mnemonic, disasm,
+      sql = """insert into main.instructions (address, label, mnemonic, disasm,
                                               comment1, comment2, name,
                                               type, pseudocomment,
                                               pseudoitp)
-                                values (?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
       self_get_instruction_id = self.get_instruction_id
       cur_execute = cur.execute
       for key in bb_data:
         for insn in bb_data[key]:
-          addr, mnem, disasm, cmt1, cmt2, name, mtype = insn
+          addr, label, mnem, disasm, cmt1, cmt2, name, mtype = insn
           db_id = self_get_instruction_id(str(addr))
           if db_id is None:
             pseudocomment = None
@@ -603,7 +605,7 @@ class CBinDiff:
             if addr in self.pseudo_comments:
               pseudocomment, pseudoitp = self.pseudo_comments[addr]
 
-            cur_execute(sql, (str(addr), mnem, disasm, cmt1, cmt2, name, mtype, pseudocomment, pseudoitp))
+            cur_execute(sql, (str(addr), label, mnem, disasm, cmt1, cmt2, name, mtype, pseudocomment, pseudoitp))
             db_id = cur.lastrowid
           instructions_ids[addr] = db_id
 
@@ -659,7 +661,7 @@ class CBinDiff:
   def prettify_asm(self, asm_source):
     asm = []
     for line in asm_source.split("\n"):
-      if not line.startswith("loc_"):
+      if not (line.startswith("loc_") or line.startswith("l_")):
         asm.append("\t" + line)
       else:
         asm.append(line)
@@ -697,6 +699,11 @@ class CBinDiff:
     return tmp
 
   def get_cmp_asm(self, asm):
+
+    #use alternative asm cleaning function
+    if self.use_alt_asm_cleaning:
+      return self.alt_get_cmp_asm(asm)
+      
     if asm is None:
       return asm
 
@@ -726,6 +733,36 @@ class CBinDiff:
 
     return tmp
 
+  def alt_get_cmp_asm(self, asm):
+    if asm is None:
+      return asm
+
+    # Ignore the comments in the assembly dump
+    tmp = asm.split(";")[0]
+    tmp = tmp.split(" # ")[0]
+    # Now, replace sub_, byte_, word_, dword_, loc_, etc...
+    for rep in CMP_REPS:
+      tmp = self.re_sub(rep + "[0-9A-F]+", "XXXX", tmp)
+
+    reps = ["\+[a-f0-9A-F]+h\+"]
+    for rep in reps:
+      tmp = self.re_sub(rep, "+XXXX+", tmp)
+    
+    tmp = self.re_sub("j_[a-z_A-Z0-9]+:", "XXXX:", tmp)
+    tmp = self.re_sub("f_[a-z_A-Z0-9]+:", "XXXX:", tmp)
+    tmp = self.re_sub("d_[a-z_A-Z0-9]+:", "XXXX:", tmp)
+    tmp = self.re_sub("d_[a-z_A-Z0-9]+", "XXXX", tmp)
+    tmp = self.re_sub("f_[a-z_A-Z0-9]+", "XXXX", tmp)
+    tmp = self.re_sub("j_[a-z_A-Z0-9]+", "XXXX", tmp)
+    tmp = self.re_sub("l_[a-z_A-Z0-9]+", "XXXX", tmp)
+    tmp = self.re_sub("a_[a-z_A-Z0-9]+", "XXXX", tmp)
+    tmp = self.re_sub("#a[a-z_A-Z0-9]+", "XXXX", tmp)
+    
+    # Strip any possible remaining white-space character at the end of
+    # the cleaned-up instruction
+    tmp = self.re_sub("[ \t\n]+$", "", tmp)
+    return tmp
+    
   def compare_graphs_pass(self, bblocks1, bblocks2, colours1, colours2, is_second = False):
     dones1 = set()
     dones2 = set()

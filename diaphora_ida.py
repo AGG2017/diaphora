@@ -226,6 +226,7 @@ class CIDAChooser(diaphora.CChooser, Choose2):
     if self.show_commands and (self.cmd_diff_asm is None or force):
       # create aditional actions handlers
       self.cmd_diff_asm = self.AddCommand("Diff assembly")
+      self.cmd_diff_cleanasm = self.AddCommand("Diff clean assembly")
       self.cmd_diff_c = self.AddCommand("Diff pseudo-code")
       self.cmd_diff_graph = self.AddCommand("Diff assembly in a graph")
       self.cmd_import_selected = self.AddCommand("Import selected")
@@ -256,8 +257,10 @@ class CIDAChooser(diaphora.CChooser, Choose2):
           self.bindiff.import_selected(self.items, self.selected_items)
     elif cmd_id == self.cmd_diff_c:
       self.bindiff.show_pseudo_diff(self.items[n])
+    elif cmd_id == self.cmd_diff_cleanasm:
+      self.bindiff.show_asm_diff(self.items[n], "clean_assembly")
     elif cmd_id == self.cmd_diff_asm:
-      self.bindiff.show_asm_diff(self.items[n])
+      self.bindiff.show_asm_diff(self.items[n], "assembly")
     elif cmd_id == self.cmd_show_asm:
       self.bindiff.show_asm(self.items[n], self.primary)
     elif cmd_id == self.cmd_show_pseudo:
@@ -327,7 +330,8 @@ class CBinDiffExporterSetup(Form):
   <Use experimental heuristics:{rExperimental}>
   <#Enable this option to ignore sub_* names for the 'Same name' heuristic.#Ignore automatically generated names:{rIgnoreSubNames}>
   <#Enable this option to ignore all function names for the 'Same name' heuristic.#Ignore all function names:{rIgnoreAllNames}>
-  <#Enable this option to ignore thunk functions, nullsubs, etc....#Ignore small functions:{rIgnoreSmallFunctions}>{cGroup1}>
+  <#Enable this option to ignore thunk functions, nullsubs, etc....#Ignore small functions:{rIgnoreSmallFunctions}>
+  <Use alternative user name style asembly code cleaning:{rUseAltAsmCleaning}>{cGroup1}>
 
   NOTE: Don't select IDA database files (.IDB, .I64) as only SQLite databases are considered.
 """
@@ -345,7 +349,8 @@ class CBinDiffExporterSetup(Form):
                                                "rFuncSummariesOnly",
                                                "rIgnoreSubNames",
                                                "rIgnoreAllNames",
-                                               "rIgnoreSmallFunctions"))}
+                                               "rIgnoreSmallFunctions",
+                                               "rUseAltAsmCleaning"))}
     Form.__init__(self, s, args)
 
   def set_options(self, opts):
@@ -355,6 +360,7 @@ class CBinDiffExporterSetup(Form):
       self.iFileOpen.value = opts.file_in
 
     self.rUseDecompiler.checked = opts.use_decompiler
+    self.rUseAltAsmCleaning.checked = opts.use_alt_asm_cleaning
     self.rExcludeLibraryThunk.checked = opts.exclude_library_thunk
     self.rUnreliable.checked = opts.unreliable
     self.rSlowHeuristics.checked = opts.slow
@@ -373,6 +379,7 @@ class CBinDiffExporterSetup(Form):
       file_out = self.iFileSave.value,
       file_in  = self.iFileOpen.value,
       use_decompiler = self.rUseDecompiler.checked,
+      use_alt_asm_cleaning = self.rUseAltAsmCleaning.checked,
       exclude_library_thunk = self.rExcludeLibraryThunk.checked,
       unreliable = self.rUnreliable.checked,
       slow = self.rSlowHeuristics.checked,
@@ -672,37 +679,39 @@ class CIDABinDiff(diaphora.CBinDiff):
     self.import_til()
     self.import_definitions()
 
-  def show_asm_diff(self, item):
+  def show_asm_diff(self, item, clean):
     cur = self.db_cursor()
     sql = """select *
                from (
-             select prototype, assembly, name, 1
+             select prototype, %s, name, 1
                from functions
               where address = ?
                 and assembly is not null
-       union select prototype, assembly, name, 2
+       union select prototype, %s, name, 2
                from diff.functions
               where address = ?
                 and assembly is not null)
-              order by 4 asc"""
+              order by 4 asc""" % (clean,clean)
     ea1 = str(int(item[1], 16))
     ea2 = str(int(item[3], 16))
     cur.execute(sql, (ea1, ea2))
     rows = cur.fetchall()
     if len(rows) != 2:
-      Warning("Sorry, there is no assembly available for either the first or the second database.")
+      Warning("Sorry, there is no %s available for either the first or the second database." % clean)
     else:
       row1 = rows[0]
       row2 = rows[1]
 
       html_diff = CHtmlDiff()
-      asm1 = self.prettify_asm(row1["assembly"])
-      asm2 = self.prettify_asm(row2["assembly"])
+      asm1 = self.prettify_asm(row1[clean])
+      asm2 = self.prettify_asm(row2[clean])
       buf1 = "%s proc near\n%s\n%s endp" % (row1["name"], asm1, row1["name"])
       buf2 = "%s proc near\n%s\n%s endp" % (row2["name"], asm2, row2["name"])
       src = html_diff.make_file(buf1.split("\n"), buf2.split("\n"))
-
-      title = "Diff assembler %s - %s" % (row1["name"], row2["name"])
+      if clean=="assembly":
+        title = "Diff assembler %s - %s" % (row1["name"], row2["name"])
+      else:
+        title = "Diff clean assembler %s - %s" % (row1["name"], row2["name"])
       cdiffer = CHtmlViewer()
       cdiffer.Show(src, title)
 
@@ -837,13 +846,18 @@ class CIDABinDiff(diaphora.CBinDiff):
 
   def import_instruction(self, ins_data1, ins_data2):
     ea1 = self.get_base_address() + int(ins_data1[0])
-    ea2, cmt1, cmt2, name, mtype, mdis, mcmt, mitp = ins_data2
+    ea2, cmt1, cmt2, name, mtype, mdis, mcmt, mitp, label = ins_data2
+    
     # Set instruction level comments
     if cmt1 is not None and get_cmt(ea1, 0) is None:
       set_cmt(ea1, cmt1, 0)
 
     if cmt2 is not None and get_cmt(ea1, 1) is None:
-      set_cmt(ea1, cmt1, 1)
+      set_cmt(ea1, cmt2, 1)
+
+    #import the user defined local label names
+    if GetTrueNameEx(ea1,ea1)!=label:
+      MakeName(ea1, label)
 
     if mcmt is not None:
       cfunc = decompile(ea1)
@@ -890,7 +904,7 @@ class CIDABinDiff(diaphora.CBinDiff):
     cur = self.db_cursor()
     try:
       # Check first if we have any importable items
-      sql = """ select ins.address ea, ins.disasm dis, ins.comment1 cmt1, ins.comment2 cmt2, ins.name name, ins.type type, ins.pseudocomment cmt, ins.pseudoitp itp
+      sql = """ select ins.address ea, ins.label label, ins.disasm dis, ins.comment1 cmt1, ins.comment2 cmt2, ins.name name, ins.type type, ins.pseudocomment cmt, ins.pseudoitp itp
                   from diff.function_bblocks bb,
                        diff.functions f,
                        diff.bb_instructions bbi,
@@ -901,6 +915,7 @@ class CIDABinDiff(diaphora.CBinDiff):
                    and f.address = ?
                    and (ins.comment1 is not null
                      or ins.comment2 is not null
+                     or ins.label is not null
                      or ins.name is not null
                      or pseudocomment is not null) """
       cur.execute(sql, (str(ea2),))
@@ -908,10 +923,10 @@ class CIDABinDiff(diaphora.CBinDiff):
       if len(import_rows) > 0:
         import_syms = {}
         for row in import_rows:
-          import_syms[row["ea"]] = [row["ea"], row["cmt1"], row["cmt2"], row["name"], row["type"], row["dis"], row["cmt"], row["itp"]]
+          import_syms[row["ea"]] = [row["ea"], row["cmt1"], row["cmt2"], row["name"], row["type"], row["dis"], row["cmt"], row["itp"], row["label"]]
 
         # Check in the current database
-        sql = """ select distinct ins.address ea, ins.disasm dis, ins.comment1 cmt1, ins.comment2 cmt2, ins.name name, ins.type type, ins.pseudocomment cmt, ins.pseudoitp itp
+        sql = """ select distinct ins.address ea, ins.label label, ins.disasm dis, ins.comment1 cmt1, ins.comment2 cmt2, ins.name name, ins.type type, ins.pseudocomment cmt, ins.pseudoitp itp
                     from function_bblocks bb,
                          functions f,
                          bb_instructions bbi,
@@ -925,7 +940,7 @@ class CIDABinDiff(diaphora.CBinDiff):
         if len(match_rows) > 0:
           matched_syms = {}
           for row in match_rows:
-            matched_syms[row["ea"]] = [row["ea"], row["cmt1"], row["cmt2"], row["name"], row["type"], row["dis"], row["cmt"], row["itp"]]
+            matched_syms[row["ea"]] = [row["ea"], row["cmt1"], row["cmt2"], row["name"], row["type"], row["dis"], row["cmt"], row["itp"], row["label"]]
 
           # We have 'something' to import, let's diff the assembly...
           sql = """select *
@@ -959,13 +974,13 @@ class CIDABinDiff(diaphora.CBinDiff):
 
               if right_line == "" or left_line == "":
                 continue
-
+              
               # At this point, we know which line number matches with
               # which another line number in both databases.
               ea1 = address1[int(left_line)-1]
               ea2 = address2[int(right_line)-1]
               changed = left[1].startswith('\x00-') and right[1].startswith('\x00+')
-              has_comments = str(ea2) in import_syms and import_syms[str(ea2)][6] is not None
+              has_comments = str(ea2) in import_syms and ((import_syms[str(ea2)][1] is not None) or (import_syms[str(ea2)][2] is not None) or (import_syms[str(ea2)][6] is not None))
               if changed or has_comments:
                 ea1 = str(ea1)
                 ea2 = str(ea2)
@@ -1278,6 +1293,7 @@ or selecting Edit -> Plugins -> Diaphora - Show results""")
       bb_topo_num[block_ea] = idx
 
       for x in list(Heads(block.startEA, block.endEA)):
+        label = GetTrueNameEx(x,x)
         mnem = GetMnem(x)
         disasm = GetDisasm(x)
         size += ItemSize(x)
@@ -1292,7 +1308,10 @@ or selecting Edit -> Plugins -> Diaphora - Show results""")
           if nodes == 1:
             assembly[block_ea] = [[x - image_base, disasm]]
           else:
-            assembly[block_ea] = [[x - image_base, "loc_%x:" % x], [x - image_base, disasm]]
+            if label!='':
+              assembly[block_ea] = [[x - image_base, "%s:" % label], [x - image_base, disasm]]
+            else:
+              assembly[block_ea] = [[x - image_base, "loc_%x:" % x], [x - image_base, disasm]]
 
         decoded_size, ins = diaphora_decode(x)
         if ins.Operands[0].type in [o_mem, o_imm, o_far, o_near, o_displ]:
@@ -1358,7 +1377,8 @@ or selecting Edit -> Plugins -> Diaphora - Show results""")
 
         ins_cmt1 = GetCommentEx(x, 0)
         ins_cmt2 = GetCommentEx(x, 1)
-        instructions_data.append([x - image_base, mnem, disasm, ins_cmt1, ins_cmt2, tmp_name, tmp_type])
+        label = GetTrueNameEx(x, x)
+        instructions_data.append([x - image_base, label, mnem, disasm, ins_cmt1, ins_cmt2, tmp_name, tmp_type])
 
         switch = get_switch_info_ex(x)
         if switch:
@@ -1761,7 +1781,8 @@ def _diff_or_export(use_ui, **options):
   t0 = time.time()
   try:
     bd = CIDABinDiff(opts.file_out)
-    bd.use_decompiler_always = opts.use_decompiler
+    bd.use_decompiler_always = opts.use_decompiler    
+    bd.use_alt_asm_cleaning = opts.use_alt_asm_cleaning
     bd.exclude_library_thunk = opts.exclude_library_thunk
     bd.unreliable = opts.unreliable
     bd.slow_heuristics = opts.slow
@@ -1811,6 +1832,7 @@ class BinDiffOptions:
     self.file_out = kwargs.get('file_out', sqlite_db)
     self.file_in  = kwargs.get('file_in', '')
     self.use_decompiler = kwargs.get('use_decompiler', True)
+    self.use_alt_asm_cleaning = kwargs.get('use_alt_asm_cleaning', False)
     self.exclude_library_thunk = kwargs.get('exclude_library_thunk', True)
     # Enable, by default, relaxed calculations on difference ratios for
     # 'big' databases (>20k functions)
